@@ -25,4 +25,4 @@ python main.py
 
 ## 存档路径
 
-`C:\Users\<用户名>\AppData\LocalLow\ComputerLunch\Cell To Singularity\`
+`C:\Users\<用户名>\AppData\LocalLow\Computer Lunch\Cell To Singularity\`
