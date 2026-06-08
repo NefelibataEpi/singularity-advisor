@@ -54,6 +54,13 @@ def main() -> None:
     file_b = save_dir / config["save_files"][1]
     top_n = config.get("top_n", 3)
 
+    if not save_dir.exists():
+        print(f"错误：存档目录不存在：{save_dir}")
+        print("请确认：")
+        print("  1. 游戏至少运行并保存过一次")
+        print("  2. config.json 中的 save_dir 路径正确")
+        sys.exit(1)
+
     state = GameState()
 
     # 启动时做一次初始解析（取最新文件）
