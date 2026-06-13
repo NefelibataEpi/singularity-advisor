@@ -34,6 +34,8 @@ class NodeDef:
     income_a: float         # baseIncomeRate.a，> 0 代表 Generator（可重复买）；== 0 代表 Research（一次性）
     effective_base_cost: float  # 真实 owned=0 时的费用 = exported_cost_a / multiplier^exported_owned
     multiplier: float       # 每购买一次费用乘以此系数
+    node_type: str = "BASE"     # "PROGRESS_BAR" | "BASE" | "NONE" 等，决定倍率公式
+    category: str = "UPGRADE"   # "UPGRADE" | "UPGRADE_TECH" | "RESEARCH" | "TROPHY" | "NONE"
     effects: list[Effect] = field(default_factory=list)
     requirements: list[Requirement] = field(default_factory=list)
     has_payout: bool = False    # 是否含 PAYOUT 效果（仅用于展示标注，不计分）
@@ -83,6 +85,8 @@ def _parse_node(raw: dict) -> NodeDef:
         income_a=income_a,
         effective_base_cost=effective_base_cost,
         multiplier=multiplier,
+        node_type=raw.get("nodeType", "BASE"),
+        category=raw.get("category", "UPGRADE"),
         effects=effects,
         requirements=requirements,
         has_payout=has_payout,

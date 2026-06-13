@@ -14,12 +14,15 @@ from advisor import recommend, Recommendation
 # 辅助：构造最小 NodeDef
 # ──────────────────────────────────────────────
 
-def _gen(uid, income, cost, mult=1.15, effects=None, reqs=None) -> NodeDef:
+def _gen(uid, income, cost, mult=1.15, effects=None, reqs=None,
+         node_type="BASE", category="UPGRADE") -> NodeDef:
     return NodeDef(
         uid=uid,
         income_a=income,
         effective_base_cost=cost,
         multiplier=mult,
+        node_type=node_type,
+        category=category,
         effects=effects or [],
         requirements=reqs or [],
     )
@@ -32,6 +35,8 @@ def _research(uid, cost, effects, mult=1.1, reqs=None) -> NodeDef:
         income_a=0.0,
         effective_base_cost=cost,
         multiplier=mult,
+        node_type="BASE",
+        category="RESEARCH",
         effects=effects,
         requirements=reqs or [],
         has_payout=has_payout,
@@ -71,10 +76,11 @@ def test_generator_excluded_when_cannot_afford():
 # Research（STANDARD 效果）
 # ──────────────────────────────────────────────
 
-def test_research_standard_delta():
-    # g_a: income=1.0, owned=5 → current_prod = 5.0 (no multiplier yet)
-    # r1: STANDARD effect on g_a, production=3 → Δ = 5.0 × (3-1) = 10.0
-    # score = 10 / 500 = 0.02
+def test_research_standard_delta_upgrade():
+    # g_a: UPGRADE/BASE, income=1.0, owned=5, no prior multipliers
+    # current_prod = 1.0 × 5 × 1.0 = 5.0
+    # r1: STANDARD p=3 on g_a (UPGRADE) → Δ = current_prod × p = 5.0 × 3.0 = 15.0
+    # score = 15.0 / 500.0 = 0.03
     nodes = {
         "g_a": _gen("g_a", income=1.0, cost=40.0),
         "r1": _research("r1", cost=500.0, effects=[
@@ -83,8 +89,54 @@ def test_research_standard_delta():
     }
     recs = recommend(currency=1000.0, owned_map={"g_a": 5.0}, nodes=nodes)
     r1 = next(r for r in recs if r.key == "r1")
-    assert r1.delta == pytest.approx(10.0)
-    assert r1.score == pytest.approx(10.0 / 500.0)
+    assert r1.delta == pytest.approx(15.0)
+    assert r1.score == pytest.approx(15.0 / 500.0)
+
+
+def test_research_standard_delta_progress_bar():
+    # g_pb: PROGRESS_BAR, income=450, owned=2, no prior STANDARD effects → current_mult=1
+    # r1: STANDARD p=2 on g_pb → new_mult = 1×2 = 2
+    # Δ = 450 × 2 × (2 − 1) = 900
+    # score = 900 / 1000 = 0.9
+    nodes = {
+        "g_pb": _gen("g_pb", income=450.0, cost=500.0, node_type="PROGRESS_BAR"),
+        "r1":   _research("r1", cost=1000.0, effects=[
+            Effect(target="g_pb", production=2.0, effect_type="STANDARD"),
+        ]),
+    }
+    recs = recommend(currency=2000.0, owned_map={"g_pb": 2.0}, nodes=nodes)
+    r1 = next(r for r in recs if r.key == "r1")
+    assert r1.delta == pytest.approx(900.0)
+    assert r1.score == pytest.approx(0.9)
+
+
+def test_progress_bar_zero_production_is_neutral():
+    # p=0 on PROGRESS_BAR → Δ = 0 (not negative), score = 0 not negative
+    nodes = {
+        "g_pb": _gen("g_pb", income=450.0, cost=500.0, node_type="PROGRESS_BAR"),
+        "r_bad": _research("r_bad", cost=100.0, effects=[
+            Effect(target="g_pb", production=0.0, effect_type="STANDARD"),
+        ]),
+    }
+    recs = recommend(currency=2000.0, owned_map={"g_pb": 5.0}, nodes=nodes)
+    r = next(r for r in recs if r.key == "r_bad")
+    assert r.delta == pytest.approx(0.0)
+    assert r.score == pytest.approx(0.0)
+
+
+def test_upgrade_p1_gives_positive_delta():
+    # p=1 on UPGRADE → Δ = current_prod × 1 = current_prod (should be > 0 if owned > 0)
+    nodes = {
+        "g_a": _gen("g_a", income=150.0, cost=10000.0),
+        "r_mag": _research("r_mag", cost=30_000_000.0, effects=[
+            Effect(target="g_a", production=1.0, effect_type="STANDARD"),
+        ]),
+    }
+    recs = recommend(currency=1e9, owned_map={"g_a": 34.0}, nodes=nodes)
+    r = next(r for r in recs if r.key == "r_mag")
+    # current_prod = 150 × 34 × 1 = 5100; Δ = 5100 × 1 = 5100
+    assert r.delta == pytest.approx(5100.0)
+    assert r.score > 0
 
 
 def test_research_excluded_if_already_owned():
@@ -99,10 +151,10 @@ def test_research_excluded_if_already_owned():
     assert "r1" not in keys
 
 
-def test_research_existing_multiplier_stacks():
-    # r1 already owned (×3 on g_a). r2 gives ×2.
-    # g_a current_prod = 1.0 × 5 × 3 = 15
-    # r2 Δ = 15 × (2-1) = 15
+def test_research_existing_multiplier_stacks_upgrade():
+    # g_a: UPGRADE/BASE. r1 owned (p=3) → multiplier = (1+3) = 4
+    # current_prod = 1.0 × 5 × 4 = 20
+    # r2: p=2 → Δ = current_prod × p = 20 × 2 = 40
     nodes = {
         "g_a": _gen("g_a", income=1.0, cost=40.0),
         "r1": _research("r1", cost=500.0, effects=[
@@ -112,10 +164,29 @@ def test_research_existing_multiplier_stacks():
             Effect(target="g_a", production=2.0, effect_type="STANDARD"),
         ]),
     }
-    owned_map = {"g_a": 5.0, "r1": 1.0}  # r1 purchased, r2 not
+    owned_map = {"g_a": 5.0, "r1": 1.0}
     recs = recommend(currency=2000.0, owned_map=owned_map, nodes=nodes)
     r2 = next(r for r in recs if r.key == "r2")
-    assert r2.delta == pytest.approx(15.0)
+    assert r2.delta == pytest.approx(40.0)
+
+
+def test_research_existing_multiplier_stacks_progress_bar():
+    # g_pb: PROGRESS_BAR. r1 owned (p=3) → current_mult = 3
+    # current_prod = 450 × 2 × 3 = 2700
+    # r2: p=2 → new_mult = 3×2 = 6; Δ = 450 × 2 × (6−3) = 2700
+    nodes = {
+        "g_pb": _gen("g_pb", income=450.0, cost=500.0, node_type="PROGRESS_BAR"),
+        "r1":   _research("r1", cost=500.0, effects=[
+            Effect(target="g_pb", production=3.0, effect_type="STANDARD"),
+        ]),
+        "r2":   _research("r2", cost=1000.0, effects=[
+            Effect(target="g_pb", production=2.0, effect_type="STANDARD"),
+        ]),
+    }
+    owned_map = {"g_pb": 2.0, "r1": 1.0}
+    recs = recommend(currency=2000.0, owned_map=owned_map, nodes=nodes)
+    r2 = next(r for r in recs if r.key == "r2")
+    assert r2.delta == pytest.approx(2700.0)
 
 
 def test_payout_effect_flagged_not_scored():
