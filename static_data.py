@@ -40,6 +40,7 @@ class NodeDef:
     requirements: list[Requirement] = field(default_factory=list)
     has_payout: bool = False    # 是否含 PAYOUT 效果（仅用于展示标注，不计分）
     title: str = ""             # 节点中文标题，来自导出 JSON 的 title 字段
+    dVar3: float = 500.0        # PROGRESS_BAR 基础周期参数（0 或缺失时兜底 500）
 
 
 def _to_float(bd: dict) -> float:
@@ -81,6 +82,9 @@ def _parse_node(raw: dict) -> NodeDef:
             need=r["need"],
         ))
 
+    raw_dvar3 = raw.get("dVar3", 0)
+    dvar3 = float(raw_dvar3) if raw_dvar3 else 500.0
+
     return NodeDef(
         uid=raw["uid"],
         income_a=income_a,
@@ -92,6 +96,7 @@ def _parse_node(raw: dict) -> NodeDef:
         requirements=requirements,
         has_payout=has_payout,
         title=raw.get("title", ""),
+        dVar3=dvar3,
     )
 
 

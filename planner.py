@@ -1,85 +1,75 @@
 """
 前瞻规划器 — 宏动作 + 自适应时间窗 + 迭代加深 DFS
 规格: docs/planner-design.md
-
-替换贪心评分器(advisor.py)的原因:
-  贪心只看单步瞬时性价比,结构性地低估乘法科技。科技的价值随底数
-  (Generator owned 数)增长而增长,贪心看不到未来,导致"发电机总优先
-  于科技"的错误排序。
 """
 from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from static_data import NodeDef
 
 # ────────────────────────────────────────────────────────────────────────────
-# 可调常量 (也可通过 config.json 中同名键覆盖,由 plan() 接受 override 字典)
+# 可调常量
 # ────────────────────────────────────────────────────────────────────────────
-BATCH_TIERS     = [1, 5, 10, 15, 20, 25]   # 发电机宏动作批量档位
-HORIZON_MULT    = 2.5     # T = max_wait × HORIZON_MULT
-MIN_HORIZON     = 60.0    # 最小规划窗口 (秒)
-MAX_HORIZON     = 7200.0  # 最大规划窗口 (秒，= 2 小时)
-DEFAULT_HORIZON = 300.0   # rate=0 时兜底 (秒)
-MAX_DEPTH       = 6       # IDDFS 最大深度
-MAX_EXPANSIONS  = 50_000  # 搜索展开总节点数上限
+BATCH_TIERS     = [1, 5, 10, 15, 20, 25]
+HORIZON_MULT    = 2.5
+MIN_HORIZON     = 60.0
+MAX_HORIZON     = 7200.0
+DEFAULT_HORIZON = 300.0
+MAX_DEPTH       = 6
+MAX_EXPANSIONS  = 50_000
 
 _ADDITIVE_CATEGORIES = frozenset({"UPGRADE", "UPGRADE_TECH"})
 
+# ─── 类型别名 ───────────────────────────────────────────────────────────────
+_EffIdx = dict[str, list[tuple[str, float]]]   # target -> [(source, production)]
+
 
 # ────────────────────────────────────────────────────────────────────────────
-# §2  State
+# §2  State / 输出结构
 # ────────────────────────────────────────────────────────────────────────────
 @dataclass
 class State:
     currency: float
-    owned: dict[str, float]   # uid -> 已购买数量；未出现的节点视为 0
-    elapsed: float = 0.0      # 从规划起点已模拟的秒数
+    owned: dict[str, float]
+    elapsed: float = 0.0
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# §5  宏动作
-# ────────────────────────────────────────────────────────────────────────────
 @dataclass
 class Macro:
     uid: str
-    count: int   # 发电机: BATCH_TIERS 之一；科技: 恒为 1
+    count: int
 
 
-# ────────────────────────────────────────────────────────────────────────────
-# 输出结构
-# ────────────────────────────────────────────────────────────────────────────
 @dataclass
 class PlanStep:
     macro: Macro
-    wait_seconds: float   # 本步需要攒钱等待的总时间
-    elapsed_after: float  # 执行完本步后的累计模拟时间
+    wait_seconds: float
+    elapsed_after: float
 
 
 @dataclass
 class PlanResult:
-    steps: list[PlanStep]          # 最优宏动作序列（含每步时间信息）
-    horizon: float                  # 规划时间窗 (秒)
-    initial_production: float       # 规划起点产出率 (/秒)
-    final_production: float         # 序列末尾预计产出率 (/秒)
-    expansions: int                 # 搜索展开节点总数
-    search_ms: float                # 搜索耗时 (毫秒)
-    truncated: bool                 # True = 达到 MAX_EXPANSIONS 后截断
-    max_depth_completed: int        # IDDFS 已完整探索的最大深度
-    initial_currency: float         # 规划起点货币
+    steps: list[PlanStep]
+    horizon: float
+    initial_production: float
+    final_production: float
+    expansions: int
+    search_ms: float
+    truncated: bool
+    max_depth_completed: int
+    initial_currency: float
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 内部: 预计算 STANDARD 效果索引 (O(n) 预处理, 避免内层循环 O(n²))
+# 预计算索引
 # ────────────────────────────────────────────────────────────────────────────
-def _build_effects_index(
-    nodes: dict[str, NodeDef],
-) -> dict[str, list[tuple[str, float]]]:
-    """target_uid -> [(source_uid, production), ...]，仅含 STANDARD 效果。"""
-    idx: dict[str, list[tuple[str, float]]] = {}
+def _build_effects_index(nodes: dict[str, NodeDef]) -> _EffIdx:
+    """STANDARD 效果索引: target_uid -> [(source_uid, production)]"""
+    idx: _EffIdx = {}
     for uid, node in nodes.items():
         for eff in node.effects:
             if eff.effect_type == "STANDARD":
@@ -87,34 +77,80 @@ def _build_effects_index(
     return idx
 
 
+def _build_payout_index(nodes: dict[str, NodeDef]) -> _EffIdx:
+    """PAYOUT 效果索引: target_uid -> [(source_uid, production)]"""
+    idx: _EffIdx = {}
+    for uid, node in nodes.items():
+        for eff in node.effects:
+            if eff.effect_type == "PAYOUT":
+                idx.setdefault(eff.target, []).append((uid, eff.production))
+    return idx
+
+
 # ────────────────────────────────────────────────────────────────────────────
-# §3  产出 / 倍率公式（与已修正的 incomeMultiplier 模型一致）
+# §3  产出 / 倍率公式
 # ────────────────────────────────────────────────────────────────────────────
 def _compute_multiplier(
     target_uid: str,
     owned: dict[str, float],
     nodes: dict[str, NodeDef],
-    effects_idx: dict[str, list[tuple[str, float]]],
+    effects_idx: _EffIdx,
 ) -> float:
-    """目标节点当前生效的总倍率（仅统计 owned >= 1 的来源节点）。"""
+    """
+    目标节点的 STANDARD 总倍率（仅统计 owned >= 1 的来源节点）。
+
+    PROGRESS_BAR:
+      mult = Π(p for p > 0)  ← 来自已购置的 STANDARD 来源
+      无任何正值效果 → 返回 0.0（"未自动化"，产出为 0）
+
+    UPGRADE / UPGRADE_TECH（非 PROGRESS_BAR）:
+      mult = Π(1 + p)，无效果时返回 1.0
+
+    其他: 1.0
+    """
     target = nodes[target_uid]
     prods = [p for src, p in effects_idx.get(target_uid, []) if owned.get(src, 0) >= 1]
 
     if target.node_type == "PROGRESS_BAR":
         pos = [p for p in prods if p > 0]
-        return math.prod(pos) if pos else 1.0
+        return math.prod(pos) if pos else 0.0   # 0.0 = 未自动化
+
     if target.category in _ADDITIVE_CATEGORIES:
         return math.prod(1 + p for p in prods) if prods else 1.0
+
     return 1.0
+
+
+def _compute_payout_mult(
+    target_uid: str,
+    owned: dict[str, float],
+    payout_idx: _EffIdx,
+) -> float:
+    """
+    目标节点的 PAYOUT 总倍率（PayoutMultiplier(false)）。
+    = Π(production) for PAYOUT 效果中来源 owned >= 1 的项；无则为 1.0。
+    """
+    prods = [p for src, p in payout_idx.get(target_uid, []) if owned.get(src, 0) >= 1]
+    return math.prod(prods) if prods else 1.0
 
 
 def compute_total_production(
     state: State,
     nodes: dict[str, NodeDef],
-    effects_idx: dict[str, list[tuple[str, float]]],
+    effects_idx: _EffIdx,
+    payout_idx: _EffIdx,
     gen_uids: list[str],
 ) -> float:
-    """所有 Generator 节点的当前每秒总产出。"""
+    """
+    所有 Generator 节点的当前每秒总产出。
+
+    PROGRESS_BAR 节点（进度条型发电机）:
+      mult = compute_multiplier → 0 表示未自动化 → 产出 = 0
+      mult > 0 → 已自动化 → 产出 = income_a × owned × payout_mult / (dVar3 / mult)
+
+    其他节点（BASE/UPGRADE 等）:
+      产出 = income_a × owned × mult
+    """
     total = 0.0
     for uid in gen_uids:
         count = state.owned.get(uid, 0)
@@ -122,7 +158,17 @@ def compute_total_production(
             continue
         node = nodes[uid]
         mult = _compute_multiplier(uid, state.owned, nodes, effects_idx)
-        total += node.income_a * count * mult
+
+        if node.node_type == "PROGRESS_BAR":
+            if mult <= 0:
+                continue   # 未自动化，不产出
+            payout_mult = _compute_payout_mult(uid, state.owned, payout_idx)
+            # 每秒产出 = income_a × owned × payout_mult / (dVar3 / mult)
+            #          = income_a × owned × payout_mult × mult / dVar3
+            total += node.income_a * count * payout_mult / (node.dVar3 / mult)
+        else:
+            total += node.income_a * count * mult
+
     return total
 
 
@@ -152,7 +198,7 @@ def _candidates(state: State, nodes: dict[str, NodeDef]) -> list[str]:
         if node.effective_base_cost <= 0:
             continue
         if node.income_a == 0 and state.owned.get(uid, 0) >= 1:
-            continue  # 一次性科技已购买
+            continue
         if not _meets_requirements(uid, state.owned, nodes):
             continue
         result.append(uid)
@@ -163,10 +209,6 @@ def _candidates(state: State, nodes: dict[str, NodeDef]) -> list[str]:
 # §5  宏动作生成
 # ────────────────────────────────────────────────────────────────────────────
 def generate_macros(state: State, nodes: dict[str, NodeDef]) -> list[Macro]:
-    """
-    对每个候选节点生成宏动作列表。
-    Generator: count ∈ BATCH_TIERS；Research: count=1（一次性）。
-    """
     macros: list[Macro] = []
     for uid in _candidates(state, nodes):
         node = nodes[uid]
@@ -185,23 +227,24 @@ def apply_macro(
     state: State,
     macro: Macro,
     nodes: dict[str, NodeDef],
-    effects_idx: dict[str, list[tuple[str, float]]],
+    effects_idx: _EffIdx,
+    payout_idx: _EffIdx,
     gen_uids: list[str],
 ) -> Optional[State]:
     """
     执行宏动作，返回新状态。
-    逐个购买：每次先检查是否需要等待，rate 在每次购买后因 owned 变化而隐式更新。
+    逐个购买，每次先检查是否需等待，rate 因 owned 变化隐式更新。
     死局（rate<=0 且钱不够）返回 None。
     """
     new = State(currency=state.currency, owned=dict(state.owned), elapsed=state.elapsed)
     for _ in range(macro.count):
         cost = _next_cost(macro.uid, new.owned.get(macro.uid, 0), nodes)
         if new.currency < cost:
-            rate = compute_total_production(new, nodes, effects_idx, gen_uids)
+            rate = compute_total_production(new, nodes, effects_idx, payout_idx, gen_uids)
             if rate <= 0:
                 return None
             wait = (cost - new.currency) / rate
-            new.currency += rate * wait   # 等价于 new.currency = cost（含浮点近似）
+            new.currency += rate * wait
             new.elapsed += wait
         new.currency -= cost
         new.owned[macro.uid] = new.owned.get(macro.uid, 0) + 1
@@ -214,10 +257,11 @@ def apply_macro(
 def adaptive_horizon(
     state: State,
     nodes: dict[str, NodeDef],
-    effects_idx: dict[str, list[tuple[str, float]]],
+    effects_idx: _EffIdx,
+    payout_idx: _EffIdx,
     gen_uids: list[str],
 ) -> float:
-    rate = compute_total_production(state, nodes, effects_idx, gen_uids)
+    rate = compute_total_production(state, nodes, effects_idx, payout_idx, gen_uids)
     if rate <= 0:
         return DEFAULT_HORIZON
 
@@ -227,7 +271,6 @@ def adaptive_horizon(
 
     costs = [_next_cost(uid, state.owned.get(uid, 0), nodes) for uid in cand_uids]
     waits = [(c - state.currency) / rate for c in costs if c > state.currency]
-    # 若全买得起，以最贵候选的"等效等待时间"作基准，保证窗口有意义
     max_wait = max(waits) if waits else max(costs) / rate
     return max(MIN_HORIZON, min(MAX_HORIZON, max_wait * HORIZON_MULT))
 
@@ -238,15 +281,15 @@ def adaptive_horizon(
 def objective(
     state: State,
     nodes: dict[str, NodeDef],
-    effects_idx: dict[str, list[tuple[str, float]]],
+    effects_idx: _EffIdx,
+    payout_idx: _EffIdx,
     gen_uids: list[str],
 ) -> float:
     """窗口末瞬时产出率（高产出率 → 后续攒钱快 → 长期进展好）。"""
-    return compute_total_production(state, nodes, effects_idx, gen_uids)
+    return compute_total_production(state, nodes, effects_idx, payout_idx, gen_uids)
     # 备选: 加权货币项（实测后决定是否启用）
     # W1, W2 = 1.0, 1e-9
-    # return compute_total_production(state, nodes, effects_idx, gen_uids) * W1 \
-    #        + state.currency * W2
+    # return compute_total_production(...) * W1 + state.currency * W2
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -258,19 +301,15 @@ def _search_dl(
     depth: int,
     max_depth: int,
     nodes: dict[str, NodeDef],
-    effects_idx: dict[str, list[tuple[str, float]]],
+    effects_idx: _EffIdx,
+    payout_idx: _EffIdx,
     gen_uids: list[str],
-    counter: list[int],           # counter[0]: 累计展开节点数（跨迭代共享）
+    counter: list[int],
 ) -> tuple[float, list[Macro]]:
-    """
-    深度限制 DFS。
-    终止条件: depth >= max_depth 或 elapsed >= horizon。
-    展开计数超过 MAX_EXPANSIONS 时中止当前层剩余分支（截断）。
-    """
     if depth >= max_depth or state.elapsed >= horizon:
-        return objective(state, nodes, effects_idx, gen_uids), []
+        return objective(state, nodes, effects_idx, payout_idx, gen_uids), []
 
-    best_val = objective(state, nodes, effects_idx, gen_uids)
+    best_val = objective(state, nodes, effects_idx, payout_idx, gen_uids)
     best_seq: list[Macro] = []
 
     for macro in generate_macros(state, nodes):
@@ -278,12 +317,13 @@ def _search_dl(
             break
         counter[0] += 1
 
-        nxt = apply_macro(state, macro, nodes, effects_idx, gen_uids)
+        nxt = apply_macro(state, macro, nodes, effects_idx, payout_idx, gen_uids)
         if nxt is None or nxt.elapsed > horizon:
             continue
 
         val, seq = _search_dl(
-            nxt, horizon, depth + 1, max_depth, nodes, effects_idx, gen_uids, counter
+            nxt, horizon, depth + 1, max_depth,
+            nodes, effects_idx, payout_idx, gen_uids, counter,
         )
         if val > best_val:
             best_val = val
@@ -302,19 +342,15 @@ def plan(
 ) -> PlanResult:
     """
     迭代加深 DFS 搜索最优宏动作序列。
-
-    IDDFS 保证:
-      - depth=1 所有单步序列完整探索（全局最优 1 步）
-      - depth=2 所有两步序列完整探索（全局最优 2 步）
-      - depth=k 在 MAX_EXPANSIONS 允许范围内尽量探索
-      - 跨深度取最佳结果（更深的部分探索若找到更优解则采纳）
+    IDDFS 保证 depth=1,2,... 逐层完整探索，直到达到 MAX_EXPANSIONS 截断。
     """
     effects_idx = _build_effects_index(nodes)
-    gen_uids = [uid for uid, n in nodes.items() if n.income_a > 0]
+    payout_idx  = _build_payout_index(nodes)
+    gen_uids    = [uid for uid, n in nodes.items() if n.income_a > 0]
 
     initial_state = State(currency=currency, owned=dict(owned_map), elapsed=0.0)
-    horizon = adaptive_horizon(initial_state, nodes, effects_idx, gen_uids)
-    initial_prod = compute_total_production(initial_state, nodes, effects_idx, gen_uids)
+    horizon = adaptive_horizon(initial_state, nodes, effects_idx, payout_idx, gen_uids)
+    initial_prod = compute_total_production(initial_state, nodes, effects_idx, payout_idx, gen_uids)
 
     counter = [0]
     best_val = float("-inf")
@@ -326,7 +362,7 @@ def plan(
     for max_d in range(1, MAX_DEPTH + 1):
         val, seq = _search_dl(
             initial_state, horizon, 0, max_d,
-            nodes, effects_idx, gen_uids, counter,
+            nodes, effects_idx, payout_idx, gen_uids, counter,
         )
         if val > best_val:
             best_val = val
@@ -342,7 +378,7 @@ def plan(
     cur = initial_state
     for macro in best_seq:
         elapsed_before = cur.elapsed
-        nxt = apply_macro(cur, macro, nodes, effects_idx, gen_uids)
+        nxt = apply_macro(cur, macro, nodes, effects_idx, payout_idx, gen_uids)
         if nxt is None:
             break
         steps.append(PlanStep(
@@ -352,7 +388,7 @@ def plan(
         ))
         cur = nxt
 
-    final_prod = compute_total_production(cur, nodes, effects_idx, gen_uids)
+    final_prod = compute_total_production(cur, nodes, effects_idx, payout_idx, gen_uids)
 
     return PlanResult(
         steps=steps,
