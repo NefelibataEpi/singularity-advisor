@@ -127,11 +127,12 @@ def _compute_payout_mult(
     payout_idx: _EffIdx,
 ) -> float:
     """
-    目标节点的 PAYOUT 总倍率（PayoutMultiplier(false)）。
-    = Π(production) for PAYOUT 效果中来源 owned >= 1 的项；无则为 1.0。
+    目标节点的 PAYOUT 总倍率（对应反编译 PayoutMultiplier(false)）。
+    = Π(1 + effect.production) for PAYOUT 效果中来源 owned >= 1 的项；无则为 1.0。
+    注意：是 (1 + production)，不是直接 production 的乘积。
     """
     prods = [p for src, p in payout_idx.get(target_uid, []) if owned.get(src, 0) >= 1]
-    return math.prod(prods) if prods else 1.0
+    return math.prod(1.0 + p for p in prods) if prods else 1.0
 
 
 def compute_total_production(
