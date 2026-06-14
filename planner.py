@@ -226,6 +226,10 @@ def generate_macros(state: State, nodes: dict[str, NodeDef]) -> list[Macro]:
                 macros.append(Macro(uid=uid, count=count))
         else:
             macros.append(Macro(uid=uid, count=1))
+    macros.sort(key=lambda m: (
+        0 if nodes[m.uid].income_a == 0 else 1,  # 科技优先于发电机
+        m.count,                                   # 发电机内按批量升序（小批量先探索）
+    ))
     return macros
 
 
