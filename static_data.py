@@ -39,6 +39,7 @@ class NodeDef:
     effects: list[Effect] = field(default_factory=list)
     requirements: list[Requirement] = field(default_factory=list)
     has_payout: bool = False    # 是否含 PAYOUT 效果（仅用于展示标注，不计分）
+    title: str = ""             # 节点中文标题，来自导出 JSON 的 title 字段
 
 
 def _to_float(bd: dict) -> float:
@@ -90,6 +91,7 @@ def _parse_node(raw: dict) -> NodeDef:
         effects=effects,
         requirements=requirements,
         has_payout=has_payout,
+        title=raw.get("title", ""),
     )
 
 
