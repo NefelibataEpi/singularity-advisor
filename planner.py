@@ -99,9 +99,10 @@ def _compute_multiplier(
     """
     目标节点的 STANDARD 总倍率（仅统计 owned >= 1 的来源节点）。
 
-    PROGRESS_BAR:
-      mult = Π(p for p > 0)  ← 来自已购置的 STANDARD 来源
-      无任何正值效果 → 返回 0.0（"未自动化"，产出为 0）
+    PROGRESS_BAR（对应反编译 incomeMultiplier()）:
+      无任何已购置 STANDARD 效果 → 返回 0.0（未自动化，产出为 0）
+      有任意已购置效果（哪怕 p=0）→ 从 1.0 起步，仅 p>0 的效果参与乘积
+      例：仅 r_beetlemania(p=0) 已购置 → mult=1；再加 r_solitary_nests(p=10) → mult=10
 
     UPGRADE / UPGRADE_TECH（非 PROGRESS_BAR）:
       mult = Π(1 + p)，无效果时返回 1.0
@@ -112,8 +113,15 @@ def _compute_multiplier(
     prods = [p for src, p in effects_idx.get(target_uid, []) if owned.get(src, 0) >= 1]
 
     if target.node_type == "PROGRESS_BAR":
-        pos = [p for p in prods if p > 0]
-        return math.prod(pos) if pos else 0.0   # 0.0 = 未自动化
+        if not prods:
+            return 0.0   # 无任何已购置的 STANDARD 效果 → 未自动化
+        # 有任意已购置效果 → 从 1 开始；仅 p>0 的效果才参与乘积
+        # （对应源码: if multiplier==0: multiplier=1; if p>0: multiplier*=p）
+        mult = 1.0
+        for p in prods:
+            if p > 0:
+                mult *= p
+        return mult
 
     if target.category in _ADDITIVE_CATEGORIES:
         return math.prod(1 + p for p in prods) if prods else 1.0
